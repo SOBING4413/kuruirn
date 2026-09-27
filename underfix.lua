@@ -4090,7 +4090,7 @@ local function queueScannerForTeleport()
 	return true
 end
 
-local function TeleportNewPlaza(regionFilter)
+local function TeleportNewPlazaFromBrowser(regionFilter)
 	local emptyResponseCount = 0
 	while true do
 		local autoRejoinState = globalEnvironment.__UNDERAP_AUTO_REJOIN_STATE
@@ -4209,6 +4209,62 @@ local function TeleportNewPlaza(regionFilter)
 				or TELEPORT_DELAY_SECONDS
 		)
 	end
+end
+
+-- Gunakan daftar server publik Roblox sebagai sumber utama, bukan snapshot Server
+-- Browser di map. Snapshot tersebut dapat dibatasi oleh region/UI, sedangkan endpoint
+-- publik mengembalikan setiap instance publik dari PlaceId saat ini.
+local function TeleportNewPlaza(regionFilter)
+	local TeleportService = cloneRef(game:GetService("TeleportService"))
+	local localPlayer = Players.LocalPlayer
+	local search = createPublicServerSearch()
+	local lastSearchMessage
+
+	while _isCurrentRun() and game.JobId ~= "" do
+		local autoRejoinState = globalEnvironment.__UNDERAP_AUTO_REJOIN_STATE
+		if autoRejoinState and autoRejoinState.Rejoining then
+			return false
+		end
+
+		local target, searchMessage = getNextUnvisitedPublicServer(
+			search,
+			game.PlaceId,
+			game.JobId
+		)
+		if not target then
+			if searchMessage ~= lastSearchMessage then
+				lastSearchMessage = searchMessage
+				warn("[UNDERAP] pencarian public server:", searchMessage)
+			end
+			task.wait(SERVER_BROWSER_RETRY_SECONDS)
+			continue
+		end
+
+		lastSearchMessage = nil
+		print("[UNDERAP] scan selesai; pindah ke public server:", target.JobId)
+		local teleportOk, teleportError = pcall(function()
+			TeleportService:TeleportToPlaceInstance(
+				target.PlaceId,
+				target.JobId,
+				localPlayer
+			)
+		end)
+		if not teleportOk then
+			warn("[UNDERAP] teleport public server gagal:", teleportError)
+			task.wait(TELEPORT_DELAY_SECONDS)
+		else
+			-- Jika teleport diterima, client akan berpindah dan bootstrap yang sudah
+			-- diantrekan akan memulai scan di JobId target. Bila tetap di JobId ini,
+			-- anggap target gagal lalu lanjut ke kandidat publik berikutnya.
+			task.wait(8)
+			if game.JobId == target.JobId then
+				return true
+			end
+			warn("[UNDERAP] JobId belum berubah; lewati target dan lanjutkan pencarian")
+		end
+	end
+
+	return false, "scanner tidak lagi aktif"
 end
 
 --// LOAD AUTO REJOIN BEFORE SCANNING
