@@ -170,6 +170,18 @@ local Config = {
 	-- Maksimal halaman server publik yang dibaca per percobaan. Cursor akan
 	-- dilanjutkan pada percobaan berikutnya sampai seluruh halaman selesai.
 	PublicServerPagesPerSearch = 5,
+	-- Scanner hanya dapat membaca BoothListings dari server yang sedang dimasuki.
+	-- Agar seluruh server publik dipindai, script harus dimuat ulang setelah teleport.
+	TeleportBootstrap = {
+		Enabled = true,
+		-- Pilih salah satu sumber yang memang tersedia di executor Anda:
+		-- SourceUrl = "https://domain-anda.example/underfix.lua",
+		SourceUrl = "",
+		ScriptPath = "underfix.lua",
+		-- Jangan pindah server jika script tidak berhasil diantrekan untuk server tujuan.
+		-- Set false hanya bila executor Anda sudah menjalankan file ini lewat autoexec.
+		RequireQueuedRestart = true,
+	},
 	ScanPerformance = {
 		-- 0 = seluruh item dimulai bersamaan tanpa antrean worker.
 		HistoryConcurrency = 0,
@@ -4041,7 +4053,44 @@ local function getNextUnvisitedPublicServer(search, placeId, currentJobId)
 	return nil, "melanjutkan halaman server berikutnya", false
 end
 
-local function TeleportNewPlaza(regionFilter)
+-- Antrekan ulang scanner sebelum teleport. BoothListings direplikasi per-server,
+-- sehingga tidak ada API client yang dapat membaca booth dari semua JobId sekaligus.
+-- queue_on_teleport menjalankan ulang file ini pada JobId tujuan agar siklus scan ->
+-- webhook tier -> hop berlanjut sampai server publik yang tersedia telah dikunjungi.
+local function queueScannerForTeleport()
+	local bootstrap = Config.TeleportBootstrap or {}
+	if bootstrap.Enabled == false then
+		return true
+	end
+
+	local queue = queue_on_teleport
+	if not queue and syn then
+		queue = syn.queue_on_teleport
+	end
+	if type(queue) ~= "function" then
+		return false, "queue_on_teleport tidak didukung executor"
+	end
+
+	local sourceUrl = tostring(bootstrap.SourceUrl or "")
+	local scriptPath = tostring(bootstrap.ScriptPath or "")
+	local bootstrapCode
+	if sourceUrl ~= "" then
+		bootstrapCode = string.format("loadstring(game:HttpGet(%q))()", sourceUrl)
+	elseif scriptPath ~= "" and isfile and readfile and isfile(scriptPath) then
+		bootstrapCode = string.format("loadstring(readfile(%q))()", scriptPath)
+	else
+		return false, "SourceUrl kosong dan ScriptPath tidak dapat dibaca"
+	end
+
+	local queued, queueError = pcall(queue, bootstrapCode)
+	if not queued then
+		return false, tostring(queueError)
+	end
+	print("[UNDERAP] scanner diantrekan untuk server tujuan")
+	return true
+end
+
+local function TeleportNewPlazaFromBrowser(regionFilter)
 	local emptyResponseCount = 0
 	while true do
 		local autoRejoinState = globalEnvironment.__UNDERAP_AUTO_REJOIN_STATE
@@ -4160,6 +4209,62 @@ local function TeleportNewPlaza(regionFilter)
 				or TELEPORT_DELAY_SECONDS
 		)
 	end
+end
+
+-- Gunakan daftar server publik Roblox sebagai sumber utama, bukan snapshot Server
+-- Browser di map. Snapshot tersebut dapat dibatasi oleh region/UI, sedangkan endpoint
+-- publik mengembalikan setiap instance publik dari PlaceId saat ini.
+local function TeleportNewPlaza(regionFilter)
+	local TeleportService = cloneRef(game:GetService("TeleportService"))
+	local localPlayer = Players.LocalPlayer
+	local search = createPublicServerSearch()
+	local lastSearchMessage
+
+	while _isCurrentRun() and game.JobId ~= "" do
+		local autoRejoinState = globalEnvironment.__UNDERAP_AUTO_REJOIN_STATE
+		if autoRejoinState and autoRejoinState.Rejoining then
+			return false
+		end
+
+		local target, searchMessage = getNextUnvisitedPublicServer(
+			search,
+			game.PlaceId,
+			game.JobId
+		)
+		if not target then
+			if searchMessage ~= lastSearchMessage then
+				lastSearchMessage = searchMessage
+				warn("[UNDERAP] pencarian public server:", searchMessage)
+			end
+			task.wait(SERVER_BROWSER_RETRY_SECONDS)
+			continue
+		end
+
+		lastSearchMessage = nil
+		print("[UNDERAP] scan selesai; pindah ke public server:", target.JobId)
+		local teleportOk, teleportError = pcall(function()
+			TeleportService:TeleportToPlaceInstance(
+				target.PlaceId,
+				target.JobId,
+				localPlayer
+			)
+		end)
+		if not teleportOk then
+			warn("[UNDERAP] teleport public server gagal:", teleportError)
+			task.wait(TELEPORT_DELAY_SECONDS)
+		else
+			-- Jika teleport diterima, client akan berpindah dan bootstrap yang sudah
+			-- diantrekan akan memulai scan di JobId target. Bila tetap di JobId ini,
+			-- anggap target gagal lalu lanjut ke kandidat publik berikutnya.
+			task.wait(8)
+			if game.JobId == target.JobId then
+				return true
+			end
+			warn("[UNDERAP] JobId belum berubah; lewati target dan lanjutkan pencarian")
+		end
+	end
+
+	return false, "scanner tidak lagi aktif"
 end
 
 --// LOAD AUTO REJOIN BEFORE SCANNING
@@ -4854,19 +4959,28 @@ do
 end
 
 --// RUN SCAN AFTER AUTO REJOIN IS LOADED
-scanAllBooth()
+local scanCompleted = scanAllBooth()
 local autoRejoinState = globalEnvironment.__UNDERAP_AUTO_REJOIN_STATE
-if autoRejoinState and autoRejoinState.Rejoining then
+if not scanCompleted then
+	warn("[UNDERAP] scan gagal/belum siap; server hop dibatalkan agar listing tidak terlewat")
+elseif autoRejoinState and autoRejoinState.Rejoining then
 	print("[UNDERAP] server hop normal dilewati karena auto-rejoin sedang aktif")
 else
 	if globalEnvironment.__UNDERAP_SERVER_HOP_RUNNING then
 		warn("[UNDERAP] server hop sudah aktif; eksekusi duplikat dilewati")
 	else
-		globalEnvironment.__UNDERAP_SERVER_HOP_RUNNING = true
-		local hopOk, hopResult = pcall(TeleportNewPlaza, nil)
-		globalEnvironment.__UNDERAP_SERVER_HOP_RUNNING = nil
-		if not hopOk then
-			warn("[UNDERAP] server hop berhenti karena error:", hopResult)
+		local bootstrap = Config.TeleportBootstrap or {}
+		local restartQueued, queueReason = queueScannerForTeleport()
+		if bootstrap.RequireQueuedRestart ~= false and not restartQueued then
+			warn("[UNDERAP] server hop dibatalkan:", queueReason)
+			warn("[UNDERAP] isi TeleportBootstrap.SourceUrl atau simpan file di TeleportBootstrap.ScriptPath")
+		else
+			globalEnvironment.__UNDERAP_SERVER_HOP_RUNNING = true
+			local hopOk, hopResult = pcall(TeleportNewPlaza, nil)
+			globalEnvironment.__UNDERAP_SERVER_HOP_RUNNING = nil
+			if not hopOk then
+				warn("[UNDERAP] server hop berhenti karena error:", hopResult)
+			end
 		end
 	end
 end
